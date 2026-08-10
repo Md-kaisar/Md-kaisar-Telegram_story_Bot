@@ -74,6 +74,16 @@ def build_app() -> Application:
     app.add_error_handler(on_error)
     return app
 
+import asyncio
+
+# Python 3.14 removed asyncio.get_event_loop()'s auto-create behavior in the main
+# thread. python-telegram-bot's run_polling() still calls get_event_loop()
+# internally, so we pre-create and set one here to avoid a RuntimeError,
+# regardless of which Python version the host ends up using.
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
 
 def main():
     init_db()
