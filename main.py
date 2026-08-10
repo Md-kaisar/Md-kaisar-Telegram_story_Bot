@@ -1,0 +1,86 @@
+"""
+MuseBot entry point.
+Run with: python main.py
+Requires TELEGRAM_BOT_TOKEN and GEMINI_API_KEY set (see .env.example).
+"""
+import logging
+
+from telegram import Update
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+
+from config import TELEGRAM_BOT_TOKEN
+from database.db import init_db
+from handlers import start, photo, callbacks, history
+
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger("musebot")
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Unhandled exception while processing update: %s", update, exc_info=context.error)
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "🌧️ Something unexpected happened. Please try again in a moment."
+            )
+        except Exception:
+            pass
+
+
+def build_app() -> Application:
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set. Add it to your .env file.")
+
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Core commands
+    app.add_handler(CommandHandler("start", start.start))
+    app.add_handler(CommandHandler("help", start.help_cmd))
+    app.add_handler(CommandHandler("style", start.style_cmd))
+    app.add_handler(CommandHandler("language", start.language_cmd))
+
+    # Standalone creative commands (act on the last sent photo)
+    app.add_handler(CommandHandler("poem", photo.poem_cmd))
+    app.add_handler(CommandHandler("caption", photo.caption_cmd))
+    app.add_handler(CommandHandler("quote", photo.quote_cmd))
+    app.add_handler(CommandHandler("haiku", photo.haiku_cmd))
+    app.add_handler(CommandHandler("story", photo.story_cmd))
+    app.add_handler(CommandHandler("palette", photo.palette_cmd))
+    app.add_handler(CommandHandler("prompt", photo.prompt_cmd))
+    app.add_handler(CommandHandler("mood", photo.mood_cmd))
+
+    # History / favorites / sharing / stats
+    app.add_handler(CommandHandler("history", history.history_cmd))
+    app.add_handler(CommandHandler("favorite", history.favorite_cmd))
+    app.add_handler(CommandHandler("favorites", history.favorites_list_cmd))
+    app.add_handler(CommandHandler("share", history.share_cmd))
+    app.add_handler(CommandHandler("stats", history.stats_cmd))
+
+    # Photos + inline button callbacks
+    app.add_handler(MessageHandler(filters.PHOTO, photo.handle_photo))
+    app.add_handler(CallbackQueryHandler(callbacks.handle_callback))
+
+    app.add_error_handler(on_error)
+    return app
+
+
+def main():
+    init_db()
+    app = build_app()
+    logger.info("MuseBot is running...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
