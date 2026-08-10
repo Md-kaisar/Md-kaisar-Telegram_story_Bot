@@ -4,7 +4,6 @@ Run with: python main.py
 Requires TELEGRAM_BOT_TOKEN and GEMINI_API_KEY set (see .env.example).
 """
 import logging
-
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -15,7 +14,6 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-
 from config import TELEGRAM_BOT_TOKEN
 from database.db import init_db
 from handlers import start, photo, callbacks, history
@@ -25,6 +23,41 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("musebot")
+
+
+# ============================================
+# Render port-scan health check
+# ============================================
+# MuseBot only talks to Telegram via polling and never opens an HTTP port on
+# its own. Render's Web Service type expects something listening on $PORT,
+# otherwise it logs "No open ports detected" and can eventually treat the
+# service as unhealthy. This tiny server runs on a background thread purely
+# to satisfy that port scan -- it has nothing to do with bot functionality.
+import os
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+
+class _HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"MuseBot is running")
+
+    def log_message(self, format, *args):
+        pass  # silence default request logging, keep our own logs clean
+
+
+def _start_health_check_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), _HealthCheckHandler)
+    server.serve_forever()
+
+
+threading.Thread(target=_start_health_check_server, daemon=True).start()
+# ============================================
+# End health check
+# ============================================
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -74,8 +107,8 @@ def build_app() -> Application:
     app.add_error_handler(on_error)
     return app
 
-import asyncio
 
+import asyncio
 # Python 3.14 removed asyncio.get_event_loop()'s auto-create behavior in the main
 # thread. python-telegram-bot's run_polling() still calls get_event_loop()
 # internally, so we pre-create and set one here to avoid a RuntimeError,
@@ -84,6 +117,7 @@ try:
     asyncio.get_event_loop()
 except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
+
 
 def main():
     init_db()
