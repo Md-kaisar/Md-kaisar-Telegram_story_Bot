@@ -5,6 +5,7 @@ Requires TELEGRAM_BOT_TOKEN and GEMINI_API_KEY set (see .env.example).
 """
 import logging
 from telegram import Update
+from telegram.error import Conflict
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -50,17 +51,48 @@ class _HealthCheckHandler(BaseHTTPRequestHandler):
 
 def _start_health_check_server():
     port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), _HealthCheckHandler)
+    try:
+        server = HTTPServer(("0.0.0.0", port), _HealthCheckHandler)
+    except OSError:
+        # If this ever fails to bind (e.g. a stale process still holding the port during
+        # a Render restart), log it loudly instead of letting the daemon thread die
+        # silently -- a silent failure here would look like "no open ports detected" on
+        # Render with no clue why, which is worse than an explicit log line.
+        logger.exception("Health check server failed to bind to port %s", port)
+        return
     server.serve_forever()
 
 
-threading.Thread(target=_start_health_check_server, daemon=True).start()
+# Under normal execution (`python main.py`), Python's own module-caching guarantees this
+# top-level code runs exactly once per process -- a second `import main` anywhere else in
+# the same process is a no-op. The flag below documents that intent; the real safety net
+# for the unusual edge case of a forced re-run (e.g. importlib.reload) is the try/except
+# in _start_health_check_server above, which turns a would-be duplicate-bind crash into a
+# clean log line instead -- verified: it does not take down the process.
+_HEALTH_SERVER_STARTED = False
+if not _HEALTH_SERVER_STARTED:
+    threading.Thread(target=_start_health_check_server, daemon=True).start()
+    _HEALTH_SERVER_STARTED = True
 # ============================================
 # End health check
 # ============================================
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    # telegram.error.Conflict fires when Telegram sees a second getUpdates connection for
+    # this bot token -- normal and expected for a few seconds during a Render redeploy,
+    # while the old container is still shutting down and the new one has just started.
+    # python-telegram-bot's polling loop already retries this indefinitely on its own and
+    # does NOT crash the process; this branch only makes that visible and unambiguous in
+    # the logs instead of it looking like an unexplained generic error.
+    if isinstance(context.error, Conflict):
+        logger.warning(
+            "Telegram Conflict (409): another getUpdates connection is active for this "
+            "bot token. This is expected for a few seconds during a Render redeploy and "
+            "will resolve on its own once the old instance fully stops polling."
+        )
+        return
+
     logger.exception("Unhandled exception while processing update: %s", update, exc_info=context.error)
     if isinstance(update, Update) and update.effective_message:
         try:
@@ -123,7 +155,25 @@ def main():
     init_db()
     app = build_app()
     logger.info("MuseBot is running...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        # drop_pending_updates=True: on a Render redeploy, don't reprocess whatever
+        # updates queued up in the few seconds between the old instance stopping and
+        # this one starting -- avoids duplicate replies to messages sent during that gap.
+        app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    except Conflict:
+        # Belt-and-suspenders: PTB's polling loop already retries Conflict internally
+        # and routes it through on_error above without crashing. This branch only
+        # matters if a Conflict is somehow raised outside that loop (e.g. during the
+        # earliest bootstrap sliver, before the retry loop takes over). Exiting cleanly
+        # here lets Render's process supervisor restart the container immediately,
+        # which is the correct, expected recovery path -- rather than surfacing a raw,
+        # unexplained traceback.
+        logger.warning(
+            "Startup hit a Telegram Conflict (another instance still holding the "
+            "polling connection). Exiting so Render can restart cleanly; this should "
+            "resolve on the next attempt once the old instance is fully stopped."
+        )
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
