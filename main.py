@@ -154,7 +154,15 @@ def build_app() -> Application:
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set. Add it to your .env file.")
 
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    # By default PTB processes updates one at a time for the whole bot -- a single
+    # slow handler (e.g. a Gemini call retrying through the model fallback chain)
+    # blocks every other update, including the user's OWN next button tap, from even
+    # starting. That queuing delay is what was causing "Query is too old" errors when
+    # someone tapped several buttons in quick succession. Capped at 8 (not PTB's
+    # default of 256) to stay within the free-tier instance's limited CPU/RAM.
+    # Safe here since this bot has no ConversationHandler or other ordering-dependent
+    # stateful flow -- every callback carries its own self-contained image key.
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).concurrent_updates(8).build()
 
     # Core commands
     app.add_handler(CommandHandler("start", start.start))
