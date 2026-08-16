@@ -36,6 +36,7 @@ logger = logging.getLogger("musebot")
 # to satisfy that port scan -- it has nothing to do with bot functionality.
 import os
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
@@ -75,6 +76,52 @@ if not _HEALTH_SERVER_STARTED:
     _HEALTH_SERVER_STARTED = True
 # ============================================
 # End health check
+# ============================================
+
+
+# ============================================
+# Keep-alive self-ping (Render free-tier only)
+# ============================================
+# Root cause this addresses: Render's free-tier Web Services spin down after 15
+# minutes with no INBOUND HTTP traffic to the public URL. A polling Telegram bot
+# never receives inbound HTTP -- all its Telegram traffic is outbound (this server
+# calling api.telegram.org) -- so the health-check endpoint above never gets hit
+# from outside, the service goes to sleep, and since polling mode means Telegram
+# never pings the URL either, it simply never wakes back up on its own. This is
+# what actually happened: "Application.stop() complete" in the logs was Render's
+# own inactivity shutdown, not a code crash.
+#
+# Fix: periodically GET the service's own public URL (well under the 15-minute
+# window) so Render always sees recent inbound traffic. RENDER_EXTERNAL_URL is
+# provided automatically by Render on Web Services -- no manual config needed.
+# On a paid Render plan (which doesn't spin down) or anywhere RENDER_EXTERNAL_URL
+# isn't set, this silently does nothing.
+import urllib.request
+
+_KEEPALIVE_INTERVAL_SECONDS = 600  # 10 min -- safely under Render's 15-min threshold
+
+
+def _start_keepalive_pinger():
+    url = os.environ.get("RENDER_EXTERNAL_URL")
+    if not url:
+        logger.info("RENDER_EXTERNAL_URL not set -- skipping keep-alive self-ping "
+                     "(expected if not running on Render, or on a paid plan).")
+        return
+    while True:
+        time.sleep(_KEEPALIVE_INTERVAL_SECONDS)
+        try:
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                logger.info("Keep-alive self-ping to %s -> HTTP %s", url, resp.status)
+        except Exception as e:
+            # Never let a failed ping (transient network blip, brief redeploy, etc.)
+            # kill this background thread -- just log and try again next interval.
+            logger.warning("Keep-alive self-ping failed (will retry in %ss): %s",
+                            _KEEPALIVE_INTERVAL_SECONDS, e)
+
+
+threading.Thread(target=_start_keepalive_pinger, daemon=True).start()
+# ============================================
+# End keep-alive self-ping
 # ============================================
 
 
