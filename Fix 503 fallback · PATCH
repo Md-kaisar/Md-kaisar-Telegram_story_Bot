@@ -1,0 +1,71 @@
+diff --git a/services/ai_service.py b/services/ai_service.py
+index e6e2ff2..3adb140 100644
+--- a/services/ai_service.py
++++ b/services/ai_service.py
+@@ -19,6 +19,13 @@ from services import prompts
+ 
+ logger = logging.getLogger(__name__)
+ 
++# MuseBot never registers tools/functions with Gemini, so automatic function calling
++# (AFC) has nothing to do here. Disabling it explicitly silences google-genai's
++# "Direct use of AFC ... is not recommended" warning -- it's not an error, just noise.
++_NO_AFC_CONFIG = types.GenerateContentConfig(
++    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True)
++)
++
+ _client = genai.Client(api_key=GEMINI_API_KEY)
+ 
+ # Google has been retiring Gemini Flash model IDs faster than their own published
+@@ -65,6 +72,15 @@ def _is_rate_limited(e: Exception) -> bool:
+     return "RESOURCE_EXHAUSTED" in msg or "429" in msg
+ 
+ 
++def _is_transiently_unavailable(e: Exception) -> bool:
++    # 503 "This model is currently experiencing high demand... try again later" --
++    # Google's own wording confirms this is temporary, not a real outage of the
++    # model. Treat it like a rate limit: try the next candidate now, but don't
++    # permanently blacklist the model since it should recover shortly.
++    msg = str(e)
++    return "UNAVAILABLE" in msg or "503" in msg
++
++
+ def _candidates_for(kind: str) -> list:
+     with _state_lock:
+         active = _active_text_model if kind == "text" else _active_vision_model
+@@ -98,7 +114,7 @@ def _generate_text(prompt: str) -> str:
+     last_err = None
+     for model in _candidates_for("text"):
+         try:
+-            response = _client.models.generate_content(model=model, contents=prompt)
++            response = _client.models.generate_content(model=model, contents=prompt, config=_NO_AFC_CONFIG)
+             with _state_lock:
+                 if model != _active_text_model:
+                     logger.info("Text model switched to '%s'", model)
+@@ -114,6 +130,9 @@ def _generate_text(prompt: str) -> str:
+             if _is_rate_limited(e):
+                 logger.warning("Text model '%s' is rate-limited right now, trying next candidate: %s", model, e)
+                 continue
++            if _is_transiently_unavailable(e):
++                logger.warning("Text model '%s' is temporarily overloaded (503), trying next candidate: %s", model, e)
++                continue
+             logger.exception("Gemini text generation failed with a non-recoverable error")
+             raise AIError(str(e)) from e
+     logger.exception("All candidate text models failed")
+@@ -141,6 +160,7 @@ def describe_scene(image_bytes: bytes, mime_type: str = "image/jpeg") -> str:
+                     types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                     prompts.scene_description_prompt(),
+                 ],
++                config=_NO_AFC_CONFIG,
+             )
+             with _state_lock:
+                 if model != _active_vision_model:
+@@ -157,6 +177,9 @@ def describe_scene(image_bytes: bytes, mime_type: str = "image/jpeg") -> str:
+             if _is_rate_limited(e):
+                 logger.warning("Vision model '%s' is rate-limited right now, trying next candidate: %s", model, e)
+                 continue
++            if _is_transiently_unavailable(e):
++                logger.warning("Vision model '%s' is temporarily overloaded (503), trying next candidate: %s", model, e)
++                continue
+             logger.exception("Gemini vision analysis failed with a non-recoverable error")
+             raise AIError(str(e)) from e
+     logger.exception("All candidate vision models failed")
